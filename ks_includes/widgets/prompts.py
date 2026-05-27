@@ -10,6 +10,9 @@ from gi.repository import Gdk, GdkPixbuf, Gio, Gtk, Pango
 
 
 class Prompt:
+    ROW_IMAGE_PADDING = 10
+    ROW_SPACING = 5
+
     def __init__(self, screen):
         self.screen = screen
         self.gtk = screen.gtk
@@ -20,10 +23,11 @@ class Prompt:
         self.prompt = None
         self.scroll_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
+            valign=Gtk.Align.CENTER,
         )
         self.groups = []
+        self.rows = []
         self.images = []
-        self.image_limits = None
         self.image_scale = None
         self.text_scale = 1
 
@@ -40,8 +44,8 @@ class Prompt:
             self.text = ""
             self.buttons = []
             self.groups = []
+            self.rows = []
             self.images = []
-            self.image_limits = None
             self.id = 1
             self.image_scale = None
             self.text_scale = 1
@@ -54,6 +58,13 @@ class Prompt:
         elif data.startswith("prompt_text_scale "):
             self.set_text_scale(data.replace("prompt_text_scale ", "", 1))
             return
+        elif data.startswith("prompt_markup"):
+            markup = data[len("prompt_markup ") :] if data.startswith("prompt_markup ") else ""
+            if markup:
+                self.set_markup(markup)
+            else:
+                self.text_scale = 1
+            return
         elif data.startswith("prompt_text"):
             self.text = data[len("prompt_text ") :] if data.startswith("prompt_text ") else ""
             if self.text:
@@ -64,6 +75,16 @@ class Prompt:
         elif data.startswith("prompt_image "):
             self.set_image(data.replace("prompt_image ", "", 1))
             return
+        elif data.startswith("prompt_button_markup "):
+            data = data.replace("prompt_button_markup ", "")
+            params = data.split("|")
+            if len(params) == 1:
+                params.append(self.text)
+            if len(params) > 3:
+                logging.error("Unexpected number of parameters on the button")
+                return
+            self.set_button(*params, markup=True)
+            return
         elif data.startswith("prompt_button "):
             data = data.replace("prompt_button ", "")
             params = data.split("|")
@@ -73,6 +94,16 @@ class Prompt:
                 logging.error("Unexpected number of parameters on the button")
                 return
             self.set_button(*params)
+            return
+        elif data.startswith("prompt_footer_button_markup"):
+            data = data.replace("prompt_footer_button_markup ", "")
+            params = data.split("|")
+            if len(params) == 1:
+                params.append(self.text)
+            if len(params) > 3:
+                logging.error("Unexpected number of parameters on the button")
+                return
+            self.set_footer_button(*params, markup=True)
             return
         elif data.startswith("prompt_footer_button"):
             data = data.replace("prompt_footer_button ", "")
@@ -99,9 +130,29 @@ class Prompt:
             )
         elif data == "prompt_button_group_end":
             if self.groups:
-                self.scroll_box.add(self.groups.pop())
+                self._add_content(self.groups.pop())
+        elif data == "prompt_row_start":
+            self.rows.append(
+                Gtk.Box(
+                    orientation=Gtk.Orientation.HORIZONTAL,
+                    spacing=self.ROW_SPACING,
+                    homogeneous=True,
+                    halign=Gtk.Align.FILL,
+                    hexpand=True,
+                    vexpand=False,
+                )
+            )
+        elif data == "prompt_row_end":
+            if self.rows:
+                row = self.rows.pop()
+                self._add_content(row)
         else:
             logging.debug(f"Unknown option {data}")
+
+    def _add_content(self, widget):
+        parent = self.rows[-1] if self.rows else self.scroll_box
+        parent.add(widget)
+        return parent
 
     @staticmethod
     def _get_moonraker_resource(path):
@@ -153,19 +204,43 @@ class Prompt:
         width, height = self._get_image_size(width, height, scale, max_width, max_height)
         return self._get_stream_image_pixbuf(data, resource, width, height)
 
-    def _load_images(self, _widget, allocation):
-        limits = max(allocation.width, 1), max(allocation.height, 1)
-        if self.image_limits == limits:
+    def _get_image_limits(self, prompt_image, allocation):
+        max_width = max(allocation.width, 1)
+        max_height = max(allocation.height, 1)
+        parent = prompt_image["parent"]
+        if parent is not self.scroll_box:
+            children = parent.get_children()
+            child_count = max(len(children), 1)
+            get_allocated_width = getattr(parent, "get_allocated_width", None)
+            if callable(get_allocated_width):
+                allocated_width = get_allocated_width()
+                if allocated_width > 1:
+                    max_width = allocated_width
+            get_spacing = getattr(parent, "get_spacing", None)
+            spacing = get_spacing() if callable(get_spacing) else 0
+            cell_width = max((max_width - spacing * (child_count - 1)) / child_count, 1)
+            max_width = max(cell_width - self.ROW_IMAGE_PADDING * 2, 1)
+        return max_width, max_height
+
+    def _load_image(self, prompt_image, max_width, max_height):
+        limits = max(round(max_width), 1), max(round(max_height), 1)
+        if prompt_image["limits"] == limits:
             return
-        self.image_limits = limits
-        for prompt_image in self.images.copy():
-            image, image_data, scale = prompt_image
-            pixbuf = self._get_scaled_image_pixbuf(image_data, scale, *limits)
-            if pixbuf is None:
-                self.scroll_box.remove(image)
+        prompt_image["limits"] = limits
+        pixbuf = self._get_scaled_image_pixbuf(
+            prompt_image["image_data"], prompt_image["scale"], *limits
+        )
+        if pixbuf is None:
+            prompt_image["parent"].remove(prompt_image["image"])
+            if prompt_image in self.images:
                 self.images.remove(prompt_image)
-                continue
-            image.set_from_pixbuf(pixbuf)
+            return
+        prompt_image["image"].set_from_pixbuf(pixbuf)
+
+    def _load_images(self, _widget, allocation):
+        for prompt_image in self.images.copy():
+            max_width, max_height = self._get_image_limits(prompt_image, allocation)
+            self._load_image(prompt_image, max_width, max_height)
 
     def set_image_scale(self, scale):
         self.image_scale = self._parse_scale(scale, default=None)
@@ -193,24 +268,73 @@ class Prompt:
         image = Gtk.Image()
         image.set_halign(Gtk.Align.CENTER)
         image.set_hexpand(True)
-        self.scroll_box.add(image)
+        image.set_from_pixbuf(pixbuf)
+        parent = self._add_content(image)
         image_data = (data, resource, pixbuf.get_width(), pixbuf.get_height())
-        self.images.append((image, image_data, image_scale))
+        prompt_image = {
+            "image": image,
+            "image_data": image_data,
+            "scale": image_scale,
+            "parent": parent,
+            "limits": None,
+        }
+        self.images.append(prompt_image)
 
     def set_text_scale(self, scale):
         self.text_scale = self._parse_scale(scale)
 
-    def set_text(self):
-        label = Gtk.Label(label=self.text, wrap=True, hexpand=True, vexpand=True)
+    def _apply_text_scale(self, label):
         if self.text_scale != 1:
             attributes = Pango.AttrList()
             attributes.insert(Pango.attr_scale_new(self.text_scale))
             label.set_attributes(attributes)
-        self.scroll_box.add(label)
         self.text_scale = 1
 
-    def set_button(self, name, gcode, style="default"):
+    def set_text(self):
+        label = Gtk.Label(label=self.text, wrap=True, hexpand=True, vexpand=True)
+        self._apply_text_scale(label)
+        self._add_content(label)
+
+    def set_markup(self, markup):
+        label = Gtk.Label(wrap=True, hexpand=True, vexpand=True)
+        try:
+            label.set_markup(markup)
+        except Exception as e:
+            logging.exception(e)
+            logging.error(f"Invalid prompt markup: {markup}")
+            label.set_text(markup)
+        self._apply_text_scale(label)
+        self._add_content(label)
+
+    @staticmethod
+    def _set_button_markup(button, markup):
+        label = Prompt._find_widget(button, Gtk.Label)
+        if label is None:
+            return
+        try:
+            label.set_markup(markup)
+        except Exception as e:
+            logging.exception(e)
+            logging.error(f"Invalid prompt button markup: {markup}")
+            label.set_text(markup)
+
+    @staticmethod
+    def _find_widget(widget, wanted_type):
+        if isinstance(widget, wanted_type):
+            return widget
+        get_children = getattr(widget, "get_children", None)
+        if not callable(get_children):
+            return None
+        for child in get_children():
+            result = Prompt._find_widget(child, wanted_type)
+            if result is not None:
+                return result
+        return None
+
+    def set_button(self, name, gcode, style="default", markup=False):
         button = self.gtk.Button(image_name=None, label=f"{name}", style=f"dialog-{style}")
+        if markup:
+            self._set_button_markup(button, name)
         button.connect(
             "clicked", self.screen._send_action, "printer.gcode.script", {"script": gcode}
         )
@@ -221,13 +345,21 @@ class Prompt:
             self.groups[-1].set_max_children_per_line(min(4, max_childs))
             self.groups[-1].set_min_children_per_line(min(4, max_childs))
         else:
-            self.scroll_box.add(button)
+            self._add_content(button)
 
-    def set_footer_button(self, name, gcode, style="default"):
-        self.buttons.append(
-            {"name": name, "response": self.id, "gcode": gcode, "style": f"dialog-{style}"}
-        )
+    def set_footer_button(self, name, gcode, style="default", markup=False):
+        button = {"name": name, "response": self.id, "gcode": gcode, "style": f"dialog-{style}"}
+        if markup:
+            button["markup"] = True
+        self.buttons.append(button)
         self.id += 1
+
+    def _apply_footer_button_markup(self):
+        for button in self.buttons:
+            if not button.get("markup"):
+                continue
+            dialog_button = self.prompt.get_widget_for_response(button["response"])
+            self._set_button_markup(dialog_button, button["name"])
 
     def show(self):
         logging.info(f"Prompt {self.header} {self.text} {self.buttons}")
@@ -262,6 +394,7 @@ class Prompt:
             content,
             self.response,
         )
+        self._apply_footer_button_markup()
         self.prompt.connect("key-press-event", self._key_press_event)
         self.prompt.connect("delete-event", self.close)
         self.screen.screensaver.close()

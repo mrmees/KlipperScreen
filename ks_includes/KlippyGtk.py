@@ -257,11 +257,8 @@ class KlippyGtk:
             max_buttons = 4
             if len(buttons) > max_buttons:
                 buttons = buttons[:max_buttons]
-            if len(buttons) > 2:
-                dialog.get_action_area().set_layout(Gtk.ButtonBoxStyle.EXPAND)
-                button_hsize = -1
-            else:
-                button_hsize = int((self.width / 3))
+            dialog.get_action_area().set_layout(Gtk.ButtonBoxStyle.EXPAND)
+            button_hsize = -1
             for button in buttons:
                 style = button["style"] if "style" in button else "dialog-default"
                 dialog.add_button(button["name"], button["response"])
